@@ -1,0 +1,18 @@
+# bloons_adventure.py (and the bloons_* modules it imports) — pinned to the working .venv (Python 3.12)
+#   python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+PyQt5==5.15.11
+# headless: the GUI is PyQt5; opencv-python's bundled Qt clashes with it
+opencv-python-headless==5.0.0.93
+numpy==2.5.3
+scikit-image==0.26.0
+imutils==0.5.4
+pytesseract==0.3.13
+ppretty==1.3
+requests==2.34.2
+
+# Not pip-installable (Fedora: sudo dnf install ...):
+#   tesseract              pytesseract's OCR engine
+#   v4l2loopback           /dev/videoN the phone's screen is read from
+#   android-tools scrcpy   Android: adb, scrcpy
+#   libimobiledevice-utils iOS: idevice_id, ideviceinfo (plus /space/git/iOS/mirror-v4l2 and its .venv)
+#   ffmpeg psmisc          ffmpeg, fuser

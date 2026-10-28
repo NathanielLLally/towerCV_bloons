@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# Like ./mirror, but sends the iPhone screen to a v4l2loopback webcam device (like scrcpy --v4l2-sink)
+# instead of opening a viewer window. No Appium needed: WDA's own MJPEG server (device :9100) is the source.
+#   DDI mount -> iproxy 8100/9100 -> WDA (dvt xcuitest) -> ffmpeg -> /dev/videoN
+# Usage: ./mirror-v4l2 [UDID]
+# Env:   V4L2_DEVICE=/dev/videoN  (default: the loopback device named "iPhone", created with sudo if missing)
+#        V4L2_SIZE=WxH            (default: first frame scaled to 1280 high; rotation is letterboxed)
+#        FPS=30  QUALITY=60       (WDA MJPEG framerate / JPEG quality)
+#        WDA_BUNDLE=...           (default com.mss.WebDriverAgentRunner)
+#        GUI_PID=pid              (default: the parent process, e.g. bloons_adventure.py; 0 = don't watch)
+# Stop with Ctrl-C, or by ending the GUI that started it; everything this script started is stopped
+# (the loopback device is left in place).
+set -u
+cd "$(dirname "$(readlink -f "$0")")"
+
+#  set to match bloons_adventure.py
+#
+# these will auto populate if not set
+V4L2_DEVICE=/dev/video0
+V4L2_SIZE=1170x540
+
+
+
+PY=.venv/bin/python
+PMD=("$PY" -m pymobiledevice3)
+WDA_BUNDLE=${WDA_BUNDLE:-com.mss.WebDriverAgentRunner}
+WDA_PORT=8100
+MJPEG_PORT=9100
+FPS=${FPS:-30}
+QUALITY=${QUALITY:-60}
+LOOPBACK_NAME=iPhone
+LOGDIR=logs
+mkdir -p "$LOGDIR"
+
+WATCH_EVERY=${WATCH_EVERY:-5}   # watchdog: seconds between WDA health checks
+WATCH_FAILS=2                   # consecutive failed checks before WDA is restarted
+
+# The Qt GUI that started this script: when it's gone, this script shuts itself down. Its start time
+# is kept so a recycled PID doesn't pass for it.
+GUI_PID=${GUI_PID:-$PPID}
+proc_start() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
+GUI_START=$([ "$GUI_PID" != 0 ] && proc_start "$GUI_PID")
+gui_alive() { [ "$GUI_PID" = 0 ] || [ "$(proc_start "$GUI_PID")" = "$GUI_START" ]; }
+
+pids=()
+wd_pid=
+ff_pid=
+cleanup() {
+  local all=("${pids[@]}" $wd_pid $ff_pid)
+  for pid in "${all[@]}"; do kill -INT "$pid" 2>/dev/null; done
+  sleep 1
+  for pid in "${all[@]}"; do kill "$pid" 2>/dev/null; done
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+die() { echo "[v4l2] ERROR: $*" >&2; exit 1; }
+log() { echo "[v4l2] $*"; }
+
+wait_http() {  # url seconds pid-to-watch(optional)
+  local url=$1 secs=$2 pid=${3:-}
+  for _ in $(seq "$secs"); do
+    curl -sf -m 2 "$url" >/dev/null && return 0
+    [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && return 1
+    sleep 1
+  done
+  return 1
+}
+
+find_loopback() {
+  local d
+  for d in /sys/class/video4linux/video*; do
+    [ "$(cat "$d/name" 2>/dev/null)" = "$LOOPBACK_NAME" ] && { echo "/dev/$(basename "$d")"; return 0; }
+  done
+  return 1
+}
+
+# 1. Device
+UDID=${1:-${PYMOBILEDEVICE3_UDID:-${IOS_UDID:-}}}
+[ -z "$UDID" ] && UDID=$(idevice_id -l 2>/dev/null | head -1)
+[ -z "$UDID" ] && die "no iPhone found over USB (idevice_id -l is empty). Plug in / unlock / trust it."
+log "device $UDID (iOS $(ideviceinfo -u "$UDID" -k ProductVersion 2>/dev/null || echo ?))"
+
+# 2. v4l2 sink
+SINK=${V4L2_DEVICE:-$(find_loopback)}
+if [ -z "$SINK" ]; then
+  log "creating v4l2loopback device \"$LOOPBACK_NAME\" (needs sudo)..."
+  sudo v4l2loopback-ctl add -n "$LOOPBACK_NAME" -x 1 >/dev/null || die "v4l2loopback-ctl add failed (is the v4l2loopback module loaded?)"
+  sleep 1
+  SINK=$(find_loopback) || die "loopback device was not created"
+fi
+[ -w "$SINK" ] || { log "granting $USER write access to $SINK (sudo)"; sudo setfacl -m "u:$USER:rw" "$SINK" || die "no write access to $SINK"; }
+log "sink $SINK"
+
+# 3. Developer disk image (no-op if already mounted)
+"${PMD[@]}" mounter auto-mount --udid "$UDID" >"$LOGDIR/mount.log" 2>&1 \
+  || log "auto-mount failed (may already be mounted) — see $LOGDIR/mount.log"
+
+# 4. WDA + port forwards, kept alive by the watchdog
+wda_up() { curl -sf -m 3 "http://127.0.0.1:$WDA_PORT/status" >/dev/null; }
+
+# Raise WDA's MJPEG framerate/quality (best effort; defaults are 10 fps / quality 25). A fresh runner
+# starts at the defaults again, so this runs after every (re)launch.
+set_mjpeg() {
+  local sid
+  sid=$(curl -sf -m 10 -H 'Content-Type: application/json' -d '{"capabilities":{"alwaysMatch":{}}}' \
+          "http://127.0.0.1:$WDA_PORT/session" | "$PY" -I -c 'import json,sys; print(json.load(sys.stdin)["sessionId"])' 2>/dev/null)
+  if [ -n "$sid" ] && curl -sf -m 10 -H 'Content-Type: application/json' \
+       -d "{\"settings\":{\"mjpegServerFramerate\":$FPS,\"mjpegServerScreenshotQuality\":$QUALITY}}" \
+       "http://127.0.0.1:$WDA_PORT/session/$sid/appium/settings" >/dev/null; then
+    log "MJPEG set to ${FPS} fps, quality $QUALITY"
+  else
+    log "could not change MJPEG settings; using WDA defaults"
+  fi
+}
+
+# Watchdog: runs in the background and owns the WDA host process for the whole session.
+# Health = WDA answers /status; after WATCH_FAILS misses in a row it relaunches the runner.
+wda_watchdog() {
+  local host= fails=0 port proxies=() guard=
+  trap 'kill $host $guard "${proxies[@]}" 2>/dev/null; exit 0' TERM INT
+  # GUI guard: its own loop, since a WDA launch below can block for over a minute
+  if [ "$GUI_PID" != 0 ]; then
+    log "watchdog: tied to GUI pid $GUI_PID ($(tr '\0' ' ' </proc/$GUI_PID/cmdline 2>/dev/null | cut -c1-60))"
+    ( while gui_alive; do sleep 2; done
+      log "watchdog: GUI pid $GUI_PID is gone — shutting down"
+      kill -TERM $$ ) &
+    guard=$!
+  fi
+  ensure_iproxy() {
+    for port in "$WDA_PORT" "$MJPEG_PORT"; do
+      pgrep -f "iproxy .*$port $port" >/dev/null && continue
+      log "watchdog: starting iproxy $port"
+      iproxy -u "$UDID" "$port" "$port" >>"$LOGDIR/iproxy.$port.log" 2>&1 &
+      proxies+=($!)
+    done
+  }
+  ensure_iproxy; sleep 1
+  # A runner left on the phone after its host died still answers for a while, then quits —
+  # only adopt a running WDA when some local xcuitest host is keeping it alive.
+  if ! { pgrep -f "dvt xcuitest $WDA_BUNDLE" >/dev/null && wda_up; }; then fails=$WATCH_FAILS; fi
+  while true; do
+    ensure_iproxy
+    if [ -n "$host" ] && ! kill -0 "$host" 2>/dev/null; then
+      log "watchdog: WDA host process exited"; host=; fails=$WATCH_FAILS
+    elif wda_up; then
+      fails=0
+    else
+      fails=$((fails + 1))
+    fi
+    if [ "$fails" -ge "$WATCH_FAILS" ]; then
+      [ -n "$host" ] && { log "watchdog: WDA not answering — restarting"; kill "$host" 2>/dev/null; sleep 2; }
+      log "watchdog: launching $WDA_BUNDLE -> $LOGDIR/wda.log"
+      "${PMD[@]}" developer dvt xcuitest "$WDA_BUNDLE" --udid "$UDID" >>"$LOGDIR/wda.log" 2>&1 &
+      host=$!
+      if wait_http "http://127.0.0.1:$WDA_PORT/status" 60 "$host"; then
+        log "watchdog: WDA is up"; set_mjpeg; fails=0
+      else
+        log "watchdog: launch failed (see $LOGDIR/wda.log); retrying in 10s"
+        kill "$host" 2>/dev/null; host=; sleep 10; continue
+      fi
+    fi
+    sleep "$WATCH_EVERY" & wait $!
+  done
+}
+
+: >"$LOGDIR/wda.log"
+wda_watchdog &
+wd_pid=$!
+wait_http "http://127.0.0.1:$WDA_PORT/status" 90 "$wd_pid" || {
+  tail -15 "$LOGDIR/wda.log" >&2
+  die "WDA not reachable on :$WDA_PORT. Check: WDA installed (./listBundles), profile valid, dev cert trusted, phone unlocked."
+}
+
+# 6. Output size: fixed for the life of the stream (v4l2 consumers can't follow size changes)
+SRC="http://127.0.0.1:$MJPEG_PORT"
+if [ -n "${V4L2_SIZE:-}" ]; then
+  W=${V4L2_SIZE%x*}; H=${V4L2_SIZE#*x}
+else
+  # WDA's first frame can predate the orientation fix-up, so size from the 10th frame
+  dims=$(timeout 15 ffprobe -v error -f mpjpeg -i "$SRC" -select_streams v:0 -read_intervals '%+#10' \
+           -show_entries frame=width,height -of csv=p=0:s=x 2>/dev/null | grep -oE '^[0-9]+x[0-9]+' | tail -1)
+  [ -z "$dims" ] && die "no frames from WDA MJPEG server on :$MJPEG_PORT"
+  sw=${dims%x*}; sh=${dims#*x}
+  H=1280; W=$(( (sw * H / sh + 1) / 2 * 2 ))
+  log "phone frames ${sw}x${sh}"
+fi
+log "streaming ${W}x${H} -> $SINK (Ctrl-C to stop; ffmpeg log: $LOGDIR/ffmpeg.log)"
+
+# ffmpeg ends when WDA's stream drops (or stalls: -rw_timeout); wait for the watchdog to bring WDA
+# back, then reconnect to the same sink with the same size.
+: >"$LOGDIR/ffmpeg.log"
+while true; do
+  ffmpeg -hide_banner -loglevel warning -nostdin \
+    -fflags nobuffer -flags low_delay -rw_timeout 5000000 -f mpjpeg -i "$SRC" \
+    -vf "scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+    -r "$FPS" -f v4l2 "$SINK" 2> >(tee -a "$LOGDIR/ffmpeg.log" >&2) &
+  ff_pid=$!
+  wait "$ff_pid"
+  log "ffmpeg exited ($?); waiting for WDA to reconnect the stream..."
+  kill -0 "$wd_pid" 2>/dev/null || die "watchdog is gone"
+  until wda_up; do sleep 1; done
+  sleep 1
+done
